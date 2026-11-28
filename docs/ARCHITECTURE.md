@@ -8,8 +8,23 @@ ConflictFree currently has two main applications:
 conflictfree-scheduler/
 ├─ backend/
 ├─ frontend/
-└─ docs/
+├─ docs/
+├─ scripts/
+│  └─ dev-common.ps1    # helpers shared by setup.ps1 / start.ps1
+├─ docker-compose.yml   # local Redis only (Decision 43)
+├─ setup.cmd / setup.ps1   # one-time setup: .env, npm install, Redis, MongoDB, service check
+└─ start.cmd / start.ps1   # run everything: Docker/Redis, MongoDB, backend :5000, frontend :5173
 ```
+
+`backend/scripts/checkServices.js` (`npm run check:services`) is the health check both scripts use.
+
+Runtime services:
+
+| Service | Development | Production (planned, Phase P) |
+| --- | --- | --- |
+| MongoDB (replica set `rs0`) | local Community Server | MongoDB Atlas |
+| Redis (BullMQ) | Docker container `conflictfree-redis` (`redis:7.4-alpine`, `noeviction`, AOF) | Redis Cloud or Upstash via `REDIS_URL=rediss://…` |
+| Google Gemini (assistant) | Gemini API with `GEMINI_API_KEY` | same |
 
 ## Backend
 
@@ -31,7 +46,7 @@ The backend is a Node.js and Express API.
 ### Backend Entry Points
 
 - `backend/src/app.js` creates the Express app, mounts middleware and routes, then a JSON 404 for unknown `/api/*` routes and the central JSON error handler (`middleware/errorHandler.js`).
-- `backend/src/server.js` loads environment variables, connects to MongoDB, creates a Node `http` server, attaches the Socket.io server (`realtime/socketServer.js`), and handles SIGINT/SIGTERM with a graceful shutdown (Socket.io → HTTP → MongoDB, with a 10s forced-exit fallback).
+- `backend/src/server.js` loads environment variables, connects to MongoDB, creates a Node `http` server, attaches the Socket.io server (`realtime/socketServer.js`), starts the BullMQ queues and workers (`queues/queueService.js`), and handles SIGINT/SIGTERM with a graceful shutdown (Socket.io → HTTP → BullMQ workers/queues/Redis → MongoDB, with a 10s forced-exit fallback).
 
 ### Shared Calendar Query Builders (`services/scheduling/calendarQueryService.js`)
 
@@ -69,31 +84,163 @@ Every payload also carries `occurredAt` (ISO-8601 UTC).
 - `context/DashboardProvider.jsx`: the provider is mounted once for `/dashboard/*`, so navigating between pages never opens extra sockets. It upserts or removes pushed records by id, idempotently with its own HTTP responses (Decision 41). It flags slot results stale on calendar or booking changes and exposes `realtimeStatus`, `availabilityStale`, and `handleRefreshAvailability`.
 - `components/AppShell.jsx`: connection indicator. `pages/dashboard/FindTimePage.jsx`: the "may be out of date" notice with Search again.
 
+### Background Jobs and In-App Notifications (Phase M)
+
+```text
+controller (after commit)
+  └─ services/schedulingEvents.js ── Socket.io push (Phase L, unchanged)
+                                 └── enqueueNotification(type, { ids only })
+                                         │  Redis (BullMQ, prefix BULLMQ_PREFIX)
+                                         ▼
+                         "notifications" Worker ── reload meeting from MongoDB
+                                         │          build records (notificationRules.js)
+                                         ▼
+                         Notification collection (upsert by user + dedupeKey)
+                                         │
+                                         ▼
+                         Socket.io "notification:created" → recipient's room
+
+"reminders" job scheduler (every REMINDER_SWEEP_INTERVAL_MS, default 60s)
+  └─ Worker runs runReminderSweep(now) → same Notification upsert + push
+```
+
+- **Configuration** (`config/redis.js`): `REDIS_URL` (`redis://` locally, `rediss://` for Upstash / Redis Cloud; TLS is implied by the scheme), `BULLMQ_PREFIX` (default `conflictfree`; tests use `cftest`, E2E `cfe2e`), `REMINDER_SWEEP_INTERVAL_MS` (default 60000, minimum 1000). Without `REDIS_URL` the API starts normally with notifications disabled (Decision 44).
+- **Connections:** one producer connection for both queues, with `enableOfflineQueue: false` and `maxRetriesPerRequest: 1` so HTTP requests never wait on Redis. Each worker gets its own connection with `maxRetriesPerRequest: null`, as BullMQ requires for blocking commands.
+- **Queues** (`queues/queueService.js`):
+
+| Queue | Jobs | Options |
+| --- | --- | --- |
+| `notifications` | `invitation.created`, `invitation.responded`, `meeting.updated`, `meeting.cancelled` | custom `jobId` = UUID; 5 attempts, exponential backoff from 1s; completed kept 1h / 1000, failed kept 7 days; concurrency 5 |
+| `reminders` | `sweep`, created by job scheduler `reminder-sweep` (`upsertJobScheduler`, `every`) | 1 attempt (the next sweep retries naturally); concurrency 1 |
+
+- **What triggers a notification job** (all from `services/schedulingEvents.js`, after the write committed):
+
+| Domain change | Job | Recipients (computed by the worker) |
+| --- | --- | --- |
+| `POST /api/meetings/confirm` | `invitation.created` `{ eventId }` | every registered invitee |
+| `PATCH /api/meetings/:id/invitation-response` | `invitation.responded` `{ eventId, responderId, status }` | the organizer |
+| `PATCH /api/events/:id` on a shared meeting, when time, location or resource changed | `meeting.updated` `{ eventId, changes }` | invitees who have not declined |
+| `POST /api/meetings/:id/cancel` | `meeting.cancelled` `{ eventId }` | every registered invitee |
+| `DELETE /api/events/:id` on a shared meeting | `meeting.cancelled` `{ deleted: true, snapshot }` | every registered invitee (from the snapshot) |
+
+- **Jobs carry ids, not content.** The worker reloads the meeting, so it notifies about the current state and skips meetings that no longer exist or were cancelled in the meantime. The one exception is a deleted meeting, whose job carries a minimal snapshot (owner id, title, start/end, participant ids).
+- **Idempotency:** every record has a `dedupeKey`, unique per user. Meeting jobs use `<type>:<jobId>`, so a retried job writes the same keys. Reminders use `event.reminder:<eventId>:<startAt ISO>`, so repeated sweeps never duplicate a reminder, while moving an event produces a new one. Records are written with `bulkWrite` `updateOne` + `$setOnInsert` + `upsert`; only newly inserted documents are pushed over Socket.io.
+- **Reminder sweep** (`queues/processors.js` → `runReminderSweep`): loads active events starting in `(now, now + 1440 min]` (index `{ startAt: 1, status: 1 }`), the recipients' `reminderMinutesBefore`, and creates a reminder for each recipient whose lead time has been reached. Recipients are the organizer and participants who **accepted**. Pending and declined invitees are not reminded. Because the sweep re-derives everything from MongoDB, a late or missed sweep still catches every event that has not started (Decision 45).
+- **Scheduler watchdog:** every 5–60s (three sweep intervals, clamped) the API checks that the `reminder-sweep` scheduler exists in Redis and re-creates it if missing. This covers Redis being down at startup and Redis losing its data while the API keeps running.
+- **Failure behaviour:** `enqueueNotification` never throws. When the producer connection is not ready it skips the job and logs `notification_enqueue_skipped`; an add that takes longer than 3s is abandoned and logged. The HTTP response is unaffected. `getQueueStatus()` returns `disabled | starting | ready | degraded` and is exposed to the UI as `deliveryStatus`. Shutdown closes workers (a running job finishes), then queues, then connections, each with a 5s timeout.
+- **Known limitation:** a meeting notification for an action taken while Redis is unreachable is not created later. Reminders are not affected. A transactional outbox would close this gap and is deferred (Decision 44).
+
+**API** (`routes/notificationRoutes.js`, all behind `requireAuth`, always scoped to `req.user.id`):
+
+```text
+GET    /api/notifications?limit=20&before=<notificationId>&unread=true
+         → { notifications, unreadCount }   (newest first, limit ≤ 50, cursor = id)
+PATCH  /api/notifications/:id/read          → { notification, unreadCount } (others' ids → 404)
+POST   /api/notifications/read-all          → { updated, unreadCount }
+GET    /api/notifications/preferences       → { preferences }
+PATCH  /api/notifications/preferences       { reminderMinutesBefore } → { preferences }
+         preferences = { reminderMinutesBefore, reminderOptions: [0,5,10,15,30,60,1440], deliveryStatus }
+```
+
+Serialized notification: `{ id, type, message, eventId, data: { eventTitle, startAt, endAt, actorName, status }, read, readAt, createdAt }`. The recipient's user id is not echoed.
+
+**Socket.io events added in Phase M** (private `user:<id>` room only):
+
+| Event | Payload |
+| --- | --- |
+| `notification:created` | `{ notification, unreadCount }` |
+| `notification:read` | `{ notificationIds, unreadCount }` or `{ all: true, unreadCount }` (keeps other tabs in sync) |
+
+**Frontend:** `services/notificationService.js`; `DashboardProvider` loads notifications and preferences on mount and on reconnect, upserts pushed notifications by id (capped at 50 in memory), applies `notification:read`, and shows reminder pushes on the status line. `components/NotificationBell.jsx` in the top bar shows the unread badge, a popover list (unread dot + bold text + hidden "(unread)" label), "Mark all as read", the reminder lead-time select, and a notice when `deliveryStatus` is not `ready`. Escape or an outside click closes it, and focus returns to the bell.
+
+### Natural-Language Scheduling Assistant (Phase N)
+
+```text
+Find a time → "Describe it" ──POST /api/assistant/parse-request { text }──▶ assistantController
+  1. validateRequestText (3–500 chars)            → 400, no quota used
+  2. per-user limiter 10/min                      → 429 + Retry-After
+  3. load the user's stored timezone
+  4. geminiClient.generateJson                    → Gemini (sentence + local time + 14-day date table + JSON schema)
+       primary model → fallback model → (both busy) wait 1.5s → one more pass
+  5. normalizeSchedulingDraft                     → validated draft + assumptions
+       people → createParticipantResolver → participant Trie (registered users only)
+◀── { request: draft, model }
+UI shows the interpretation → "Search these times" (smart suggestions) or "Fill the form only"
+```
+
+- **Files:** `config/gemini.js`, `services/assistant/geminiClient.js` (REST, timeouts, fallback, busy retry, `AssistantError`), `schedulingPrompt.js` (system instruction, date table, response schema), `schedulingRequestParser.js` (validation and normalization), `assistantService.js` (client singleton, participant resolver, quota), `rateLimiter.js`, `controllers/assistantController.js`, `routes/assistantRoutes.js`, `scripts/assistantSmoke.js`.
+- **Configuration:** `GEMINI_API_KEY` (required to enable), `GEMINI_MODEL` (default `gemini-3.5-flash-lite`), `GEMINI_FALLBACK_MODEL` (default `gemini-3.1-flash-lite`; `none` disables it), `GEMINI_TIMEOUT_MS` (default 12000, allowed 1000–60000). Request settings: temperature 0, `maxOutputTokens` 1024, `thinkingLevel: "minimal"`.
+- **API** (both behind `requireAuth`):
+
+```text
+GET  /api/assistant/status         → { assistant: { enabled, model } }
+POST /api/assistant/parse-request  { text } → { request, model }
+     request = {
+       title, durationMinutes, timezone,
+       windowStart, windowEnd,              // UTC ISO
+       windowStartLocal, windowEndLocal,    // "YYYY-MM-DDTHH:mm" in the user's zone
+       participants: [{ query, status: "matched"|"ambiguous"|"not_found", matches: [{ id, name, email }] }],
+       preferences: { preferredStartHour?, preferredEndHour?, avoidEarlyMorning?, avoidLateDay? },
+       resource: { type: "room"|"equipment"|null, attendeeCount|null },
+       assumptions: [string], clarification: string
+     }
+Errors: 400 bad text · 401 · 422 not a scheduling request / past window / blocked · 429 · 502 upstream misconfiguration · 503 not configured or busy · 504 timeout
+```
+
+- **Frontend:** `services/assistantService.js`; `components/RequestAssistant.jsx`, shown on Find a time only when `/api/assistant/status` says it is enabled. The provider's `handleApplyAssistantRequest(draft, people, { search })` fills `slotSearchData`, the picked participants and the composer title. With `search: true` it calls `handleFindSuggestions(undefined, { searchData, participants })` on those exact values; the search builders accept explicit data for this.
+- Privacy and safety rules: Decision 47. Model choice and failure policy: Decision 48. Cost control and testing: Decision 49.
+
 ### Backend Folder Structure
 
 ```text
 backend/src/
 ├─ config/
-│  └─ database.js
+│  ├─ database.js
+│  ├─ gemini.js                # GEMINI_API_KEY / models / timeout
+│  ├─ origins.js
+│  └─ redis.js                 # REDIS_URL / BULLMQ_PREFIX / sweep interval, ioredis connections
 ├─ controllers/
+│  ├─ assistantController.js
 │  ├─ authController.js
 │  ├─ eventController.js
+│  ├─ meetingController.js
+│  ├─ notificationController.js
 │  ├─ participantController.js
 │  ├─ resourceController.js
 │  └─ schedulingController.js
 ├─ middleware/
+│  ├─ errorHandler.js
 │  └─ requireAuth.js
 ├─ models/
 │  ├─ Event.js
+│  ├─ Notification.js
 │  ├─ Resource.js
 │  └─ User.js
+├─ queues/
+│  ├─ processors.js            # notification job processor, reminder sweep
+│  └─ queueService.js          # queues, workers, scheduler, watchdog, enqueue
+├─ realtime/
+│  ├─ realtimeService.js
+│  └─ socketServer.js
 ├─ routes/
+│  ├─ assistantRoutes.js
 │  ├─ authRoutes.js
 │  ├─ eventRoutes.js
+│  ├─ meetingRoutes.js
+│  ├─ notificationRoutes.js
 │  ├─ participantRoutes.js
 │  ├─ resourceRoutes.js
 │  └─ schedulingRoutes.js
 ├─ services/
+│  ├─ assistant/
+│  │  ├─ assistantService.js        # client singleton, participant resolver, quota
+│  │  ├─ geminiClient.js            # REST client: timeout, fallback, busy retry
+│  │  ├─ rateLimiter.js             # per-user sliding window
+│  │  ├─ schedulingPrompt.js        # system instruction, date table, JSON schema
+│  │  └─ schedulingRequestParser.js # validation + normalization of the model's answer
+│  ├─ notifications/
+│  │  ├─ notificationRules.js    # pure: recipients, wording, due reminders
+│  │  └─ notificationService.js  # idempotent create, list, read, push
 │  ├─ scheduling/
 │  │  ├─ availableSlotService.js
 │  │  ├─ backtrackingSchedulingService.js
@@ -130,12 +277,15 @@ The frontend does not read or store the JWT in JavaScript storage.
 
 #### Auth Routes
 
-- `POST /api/auth/register`
+- `POST /api/auth/register` (`{ name, email, password, timezone? }`; an invalid or missing timezone is stored as UTC)
 - `POST /api/auth/login`
 - `GET  /api/auth/google`
 - `GET  /api/auth/google/callback`
 - `GET  /api/auth/me`
+- `PATCH /api/auth/me` (`{ timezone }`, IANA names only; Decision 51)
 - `POST /api/auth/logout`
+
+The user's stored timezone is the single source for reading and showing local times: reminders, the week calendar, slot preferences, and the assistant's relative dates. The frontend sends the browser's zone at sign-up. The sidebar offers "Use <browser zone>" when the account's zone differs.
 
 ### Backend Event Design
 
@@ -237,6 +387,24 @@ The scheduling engine provides conflict detection, available slot discovery, and
 - `passwordHash` (for local users, excluded from queries by default)
 - `authProvider` ("local" | "google")
 - `calendarVersion` (Number, default: 0 — atomic write-conflict version counter for replica-set transaction locks)
+- `reminderMinutesBefore` (Number, enum `[0, 5, 10, 15, 30, 60, 1440]`, default 15; 0 = reminders off). Users created before Phase M have no value and are treated as 15.
+
+#### Notification Model (`Notification.js`, Phase M)
+
+- `user` (ObjectId ref User, required): the recipient
+- `type` (enum `invitation.created | invitation.responded | meeting.updated | meeting.cancelled | event.reminder`)
+- `message` (String, required, max 300)
+- `event` (ObjectId ref Event, default `null`; `null` for deleted meetings)
+- `data` (`{ eventTitle, startAt, endAt, actorName, status }`, captured when created)
+- `dedupeKey` (String, required)
+- `readAt` (Date, default `null`)
+- `createdAt` / `updatedAt`
+
+Indexes:
+- `{ user: 1, dedupeKey: 1 }` unique (idempotency)
+- `{ user: 1, _id: -1 }` (newest-first list and id cursor)
+- `{ user: 1, readAt: 1 }` (unread count)
+- `{ createdAt: 1 }` TTL, `expireAfterSeconds` = 90 days
 
 #### Resource Model (`Resource.js`)
 
@@ -280,6 +448,7 @@ Indexes:
 - `{ "participants.email": 1, startAt: 1 }`
 - `{ "participants.user": 1, "participants.status": 1 }`
 - `{ status: 1 }`
+- `{ startAt: 1, status: 1 }` (reminder sweep window, Phase M)
 
 ---
 
@@ -300,7 +469,7 @@ The frontend is a React and Vite Single Page Application.
 
 ```text
 frontend/
-├─ index.html                 # Loads Geist / Geist Mono from Google Fonts
+├─ index.html                 # No external requests; fonts are bundled (Decision 50)
 ├─ public/favicon.svg         # Brand mark
 └─ src/
    ├─ components/
@@ -308,7 +477,9 @@ frontend/
    │  ├─ AuthAside.jsx        # Illustration panel on public pages
    │  ├─ BrandMark.jsx
    │  ├─ Icon.jsx             # Inline stroke-SVG icon set
+   │  ├─ NotificationBell.jsx # Top-bar bell, unread badge, notification popover (Phase M)
    │  ├─ ParticipantPicker.jsx
+   │  ├─ RequestAssistant.jsx # "Describe it" Gemini panel on Find a time (Phase N)
    │  ├─ ProtectedRoute.jsx
    │  └─ dashboard/
    │     └─ WeekCalendar.jsx
@@ -331,13 +502,14 @@ frontend/
    │     ├─ EventComposerPage.jsx
    │     ├─ FindTimePage.jsx
    │     └─ ResourcesPage.jsx
-   ├─ services/               # apiClient, auth, event, health, meeting,
-   │                          # participantSearch, resource, scheduling
+   ├─ services/               # apiClient, assistant, auth, event, health, meeting, notification,
+   │                          # participantSearch, realtimeClient, resource, scheduling
    ├─ test/
    │  ├─ renderDashboard.jsx  # Renders the /dashboard/* route tree in tests
    │  └─ setup.js
    ├─ utils/
    │  ├─ calendarLayout.js    # Week layout, overlap columns, upcoming conflicts
+   │  ├─ relativeTime.js      # "5 min ago", reminder option labels
    │  └─ timezone.js
    ├─ App.css                 # Design tokens and all component styles
    ├─ App.jsx
@@ -373,7 +545,7 @@ frontend/
 Defined as CSS custom properties at the top of `App.css`:
 
 - Colour: warm paper ground `#F3F2EE`, white surfaces, hairline borders `#E3E1DA`, ink text `#15161A`. There are two signal colours: free/confirmed green `#0D6650` and conflict orange `#B4430E`, each with a light tint. Every state also has a shape cue: solid fill, dashed outline for invitations, hatching or outline for conflicts.
-- Type: Geist for UI text, Geist Mono with tabular numbers for all times, dates, and counts.
+- Type: Geist for UI text, Geist Mono with tabular numbers for all times, dates, and counts. Both are self-hosted variable fonts from `@fontsource-variable/geist` and `@fontsource-variable/geist-mono`, imported in `src/main.jsx` (Decision 50).
 - Controls: 8px radius, 44px minimum touch targets, black primary buttons. Panels use a 12px radius and no drop shadows.
 - Layout: a 240px sidebar that collapses into a top bar with a horizontally scrolling nav below 860px. Pages use a main column plus a side column that wraps on narrow screens. The week calendar scrolls horizontally inside its own box on phones.
 - Icons are inline stroke SVGs (`Icon.jsx`). No emoji.
@@ -502,8 +674,8 @@ Phase J turns discovered conflict-free time slots and auto-allocated resources i
 ### Backend Testing
 
 Backend uses Node's native test runner (`node:test`), `assert/strict`, `supertest`, and `socket.io-client`.
-`npm test` preloads `tests/helpers/testEnv.js`, which forces a dedicated `*_test` database (Decision 31).
-Integration tests require the local `rs0` replica set.
+`npm test` preloads `tests/helpers/testEnv.js`, which forces a dedicated `*_test` database (Decision 31) and the BullMQ prefix `cftest`.
+Integration tests require the local `rs0` replica set. `queue.integration.test.js` also requires Redis (`docker compose up -d redis`); it fails with that instruction if Redis is unreachable.
 Test files are in `backend/tests/`:
 
 - `health.test.js` — Health route checks
@@ -543,7 +715,21 @@ Test files are in `backend/tests/`:
 - `socket.realtime.test.js` — Socket.io cookie authentication, Origin allow-list, token expiry disconnect, per-user scoping of meeting/invitation/event events, rolled-back writes emit nothing, resource broadcasts without private data (14 tests)
 - `realtime.unit.test.js` — Cookie parsing, origin allow-list, recipient derivation, room targeting (5 tests)
 
-Total (2026-11-18): 342 backend tests passing across 36 test files.
+Phase M:
+- `notificationRules.test.js` — Recipients, wording, dedupe keys, lead-time formatting, due-reminder selection (11 tests, pure)
+- `redisConfig.test.js` — `REDIS_URL` validation, TLS for `rediss://`, prefix safety, sweep interval floor (6 tests, pure)
+- `schedulingEvents.changes.test.js` — Which meeting edits count as attendee-relevant changes (3 tests, pure)
+- `notification.processors.test.js` — Job processor and reminder sweep against MongoDB: recipients, retry idempotency, RSVP, declined/cancelled handling, deleted-meeting snapshot, lead times, pending invitees, reschedule (9 tests)
+- `notification.routes.test.js` — Auth, per-user scoping, id cursor pagination without gaps, unread filter, mark read / read-all, preference validation, TTL and unique indexes (8 tests)
+- `queue.integration.test.js` — Real Redis + BullMQ + MongoDB + HTTP + Socket.io: invitation, RSVP, reschedule vs description-only edit, deletion, job options, reminder scheduler, watchdog recovery after Redis data loss, Redis unreachable (8 tests)
+
+Phase N and fixes:
+- `geminiClient.test.js` — config defaults and validation, key only in a header, JSON mode and minimal thinking, fallback on 503, two-pass busy retry, no second pass after a timeout, thinking-level retry, no fallback on config errors, timeout → 504, network errors, unreadable or blocked answers (11 tests, fake `fetch`)
+- `schedulingRequestParser.test.js` — text limits, prompt contents, UTC/local conversion, offsets, matched/ambiguous/not-found people, defaults, garbage and past windows, 31-day cap, duration clamps, preference/resource validation, dropped extra fields, title fallback, the full pipeline, the resolver's exact-match preference, the rate limiter (16 tests, pure)
+- `assistant.routes.test.js` — auth, disabled without a key (503), stored timezone used, people resolved against real accounts and the requester excluded, no user data sent to the model, validation before any model call, 422/503/500 handling without leaking internals, 10/min limit per user with `Retry-After`, status (8 tests)
+- `auth.timezone.test.js` — the browser timezone is stored at sign-up, invalid or missing → UTC, `PATCH /api/auth/me` validation and auth (4 tests)
+
+Total (2026-11-21): 426 backend tests passing across 46 test files (run against MongoDB Atlas).
 
 ### Frontend Testing
 
@@ -566,15 +752,25 @@ Test files are located alongside components and pages in `frontend/src/`:
 - `DashboardRealtime.test.jsx` (9 tests — live invitations, in-place event/meeting/resource updates, stale slot results with Search again, resync, expiry, duplicate-push race)
 - `apiClient.test.js` (5 tests — credentials, JSON errors, non-JSON errors, network failure, 204)
 
+- `DashboardNotifications.test.jsx` (13 tests — unread badge, panel contents, live push, duplicate push, reminder on status line, click marks read and opens Events, mark all read, cross-tab read sync, reminder preference, paused-delivery notice, Escape/focus, failed load, reconnect refetch)
+- `relativeTime.test.js` (2 tests)
+- `DashboardAssistant.test.jsx` (8 tests — hidden without a key, enable rules, interpretation summary, ambiguous choice, fill-only, search with exact parsed values, unresolved names left out, error display, Enter vs Shift+Enter)
+- `TimezoneSettings.test.jsx` (3 tests — sign-up sends the browser zone, one-click switch updates the account, sidebar and composer, no button when the zones match)
+
 Unit tests never open real sockets: `src/test/setup.js` mocks `createRealtimeSocket` with `src/test/fakeRealtimeSocket.js`.
 
-Total: 90 frontend tests passing across 14 test files (2026-11-18).
+Total: 116 frontend tests passing across 18 test files (2026-11-21).
 
 ### End-to-End Testing
 
 Playwright tests are in `frontend/e2e/`. Playwright starts its own backend (`:5100`) and Vite (`:5180`) against `conflictfree_e2e`, which `e2e/globalSetup.js` resets before each run (Decision 42). Any server already on `:5000` or `:5173` is left alone.
 
 - `realtime.spec.js` (1 test): two browser contexts (two users). Invitation, acceptance, cancellation, and a new room each reach the other user's open dashboard without a reload.
+- `notifications.spec.js` (2 tests, Phase M): (1) two users — invitation, RSVP and cancellation notifications arrive through BullMQ and Socket.io, and "Mark all as read" persists across a reload; (2) a reminder arrives from the background sweep with no user action, and the reminder lead time persists.
+
+- `assistant.spec.js` (1 test, Phase N): through the real Gemini API, a sentence is parsed, the named person is resolved to their real account, "Search these times" returns ranked slots, and picking one opens the composer with the parsed title, ready to "Confirm shared meeting". It retries up to 3 times if the UI reports Gemini as busy.
+
+Phase M settings for the E2E backend: `REDIS_URL` (`E2E_REDIS_URL`, default `redis://127.0.0.1:6379`), `BULLMQ_PREFIX=cfe2e`, `REMINDER_SWEEP_INTERVAL_MS=2000`. `globalSetup` deletes all `cfe2e:*` keys and refuses any prefix not ending in `e2e`. Playwright starts the web servers before `globalSetup`, so that reset also removes the backend's reminder scheduler; the watchdog restores it within about 6s, which the reminder test exercises on every run.
 
 - `foundation.spec.js` (13 tests):
   - Frontend/backend health connection

@@ -120,6 +120,8 @@ eventSchema.index({ "participants.user": 1, startAt: 1 });
 eventSchema.index({ "participants.email": 1, startAt: 1 });
 eventSchema.index({ "participants.user": 1, "participants.status": 1 });
 eventSchema.index({ status: 1 });
+// Reminder sweep: active events starting inside the next reminder window.
+eventSchema.index({ startAt: 1, status: 1 });
 
 const Event = mongoose.models.Event || mongoose.model("Event", eventSchema);
 

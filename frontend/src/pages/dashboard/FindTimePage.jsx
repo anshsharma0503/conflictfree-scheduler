@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Icon from "../../components/Icon";
 import ParticipantPicker from "../../components/ParticipantPicker";
+import RequestAssistant from "../../components/RequestAssistant";
 import { useDashboard } from "../../hooks/useDashboard";
 import { formatMinutes, getZonedParts } from "../../utils/calendarLayout";
 import { formatEventTime } from "../../utils/timezone";
@@ -106,6 +107,7 @@ function FindTimePage() {
     selectedSlotResource,
     availabilityStale,
     handleRefreshAvailability,
+    assistantStatus,
   } = useDashboard();
 
   const currentTab =
@@ -151,6 +153,10 @@ function FindTimePage() {
           </p>
         </div>
       </div>
+
+      {assistantStatus?.enabled ? (
+        <RequestAssistant onSearch={() => setActiveTab("suggestions")} />
+      ) : null}
 
       <div className="split">
         <form

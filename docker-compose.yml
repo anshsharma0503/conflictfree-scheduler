@@ -1,0 +1,36 @@
+# Local development services for ConflictFree.
+#
+# Only Redis runs in Docker (Decision 43). MongoDB stays on the local
+# Community Server replica set `rs0` (see SETUP.md).
+#
+#   docker compose up -d redis     # start
+#   docker compose ps              # should show "healthy"
+#   docker compose down            # stop (data is kept in the volume)
+#
+# Production uses a managed Redis (Redis Cloud or Upstash) through REDIS_URL.
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: conflictfree-redis
+    restart: unless-stopped
+    # BullMQ requires `noeviction`: an evicted key would silently lose jobs.
+    # AOF persistence keeps queued jobs across container restarts.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      # Bound to loopback only: the dev Redis has no password.
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis-data:

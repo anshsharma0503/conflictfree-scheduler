@@ -2,6 +2,10 @@ import mongoose from "mongoose";
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/** Allowed reminder lead times in minutes. 0 turns reminders off. */
+export const REMINDER_LEAD_OPTIONS = Object.freeze([0, 5, 10, 15, 30, 60, 1440]);
+export const DEFAULT_REMINDER_MINUTES = 15;
+
 const userSchema = new mongoose.Schema(
   {
     googleId: {
@@ -48,6 +52,12 @@ const userSchema = new mongoose.Schema(
     calendarVersion: {
       type: Number,
       default: 0,
+    },
+    // Minutes before an event's start to send an in-app reminder (0 = off).
+    reminderMinutesBefore: {
+      type: Number,
+      enum: REMINDER_LEAD_OPTIONS,
+      default: DEFAULT_REMINDER_MINUTES,
     },
   },
   {

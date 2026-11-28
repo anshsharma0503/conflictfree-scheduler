@@ -1,6 +1,7 @@
 import User from "../models/User.js";
 import { hashPassword, verifyPassword } from "./passwordService.js";
 import { invalidateParticipantSearchCache } from "./search/participantSearchService.js";
+import { normalizeTimezone } from "./timezoneService.js";
 
 export async function findOrCreateUserFromGoogleProfile(
   profile,
@@ -52,7 +53,7 @@ export async function findOrCreateUserFromGoogleProfile(
 }
 
 export async function registerLocalUser(
-  { name, email, password },
+  { name, email, password, timezone },
   { UserModel = User } = {},
 ) {
   if (!name?.trim()) {
@@ -78,6 +79,9 @@ export async function registerLocalUser(
     email,
     passwordHash,
     authProvider: "local",
+    // The browser's IANA zone when valid; anything else falls back to UTC
+    // rather than failing the sign-up (Decision 51).
+    timezone: normalizeTimezone(timezone, "UTC"),
   });
   invalidateParticipantSearchCache();
   return newUser;

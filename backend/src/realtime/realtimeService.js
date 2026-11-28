@@ -19,6 +19,7 @@ export const REALTIME_EVENTS = Object.freeze({
   RESOURCE_DEACTIVATED: "resource:deactivated",
   RESOURCE_BOOKING_CHANGED: "resource:booking-changed",
   NOTIFICATION_CREATED: "notification:created",
+  NOTIFICATION_READ: "notification:read",
 });
 
 /** Room every authenticated socket joins; used only for non-private data. */

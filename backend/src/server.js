@@ -2,6 +2,7 @@ import "dotenv/config";
 import http from "node:http";
 import app from "./app.js";
 import { connectDatabase, disconnectDatabase } from "./config/database.js";
+import { startQueues, stopQueues } from "./queues/queueService.js";
 import { closeSocketServer, createSocketServer } from "./realtime/socketServer.js";
 import { logger } from "./services/logger.js";
 
@@ -14,6 +15,10 @@ async function startServer() {
 
     const httpServer = http.createServer(app);
     const io = createSocketServer(httpServer);
+
+    // Background jobs (Phase M). Without REDIS_URL this logs a warning and
+    // the API runs with notifications and reminders turned off.
+    await startQueues();
 
     httpServer.listen(port, () => {
       logger.info("server_started", { port: Number(port) });
@@ -39,6 +44,8 @@ async function startServer() {
       try {
         await closeSocketServer(io);
         await new Promise((resolve) => httpServer.close(() => resolve()));
+        // Workers finish their current job before the database closes.
+        await stopQueues();
         await disconnectDatabase();
         logger.info("server_shutdown_complete", {});
         process.exit(0);

@@ -27,8 +27,8 @@
   --conflict-tint: #fbebe1;
   --conflict-line: #ebb79a;
 
-  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: "Geist Variable", "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono Variable", "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   --radius-sm: 6px;
   --radius: 8px;
@@ -2259,5 +2259,298 @@ a:hover {
   border-radius: var(--radius);
   background: var(--conflict-tint);
   color: var(--conflict-ink);
+  font-size: 13px;
+}
+
+/* --------------------------------------------------------------------------
+   Notifications (Phase M)
+   -------------------------------------------------------------------------- */
+
+.notification-bell {
+  position: relative;
+}
+
+.notification-trigger {
+  position: relative;
+  width: var(--control-h);
+  height: var(--control-h);
+}
+
+.notification-count {
+  position: absolute;
+  top: 4px;
+  right: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 2px solid var(--paper);
+  border-radius: 9px;
+  background: var(--conflict);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.notification-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: min(380px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 96px));
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: 0 12px 32px rgba(21, 22, 26, 0.12);
+}
+
+.notification-panel-header,
+.notification-panel-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.notification-panel-header {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.notification-panel-header h2 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.notification-panel-footer {
+  border-top: 1px solid var(--line-soft);
+  background: var(--surface-sunk);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+
+.notification-panel-footer select {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.notification-notice {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 12px 16px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--conflict-line);
+  border-radius: var(--radius);
+  background: var(--conflict-tint);
+  color: var(--conflict-ink);
+  font-size: 13px;
+}
+
+.notification-empty {
+  padding: 32px 16px;
+  text-align: center;
+}
+
+.notification-list {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.notification-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.notification-item:hover {
+  background: var(--surface-sunk);
+}
+
+.notification-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.notification-item.unread .notification-dot {
+  background: var(--free);
+}
+
+.notification-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.notification-message {
+  color: var(--ink-2);
+}
+
+.notification-item.unread .notification-message {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.notification-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+@media (max-width: 720px) {
+  .notification-panel {
+    position: fixed;
+    top: 64px;
+    right: 16px;
+    left: 16px;
+    width: auto;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Scheduling assistant (Phase N)
+   -------------------------------------------------------------------------- */
+
+.assistant-panel {
+  gap: 12px;
+}
+
+.assistant-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.assistant-head h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.assistant-badge {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.assistant-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.assistant-form textarea {
+  flex: 1 1 320px;
+  min-height: var(--control-h);
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  resize: vertical;
+}
+
+.assistant-form textarea:focus {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.assistant-error {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--conflict-line);
+  border-radius: var(--radius);
+  background: var(--conflict-tint);
+  color: var(--conflict-ink);
+}
+
+.assistant-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-sunk);
+}
+
+.assistant-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px 20px;
+}
+
+.assistant-summary dt {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.assistant-summary dd {
+  font-weight: 600;
+}
+
+.assistant-people {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.assistant-people .tag {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.assistant-choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.assistant-choice legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+
+.assistant-notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink-2);
   font-size: 13px;
 }

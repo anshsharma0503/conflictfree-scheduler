@@ -29,6 +29,15 @@ export function clearStoredUser() {
   localStorage.removeItem(AUTH_USER_KEY);
 }
 
+/** The browser's IANA time zone, e.g. "Asia/Kolkata" (null if unknown). */
+export function getBrowserTimezone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function registerUser({ name, email, password }) {
   const response = await apiRequest("/api/auth/register", {
     method: "POST",
@@ -36,6 +45,7 @@ export async function registerUser({ name, email, password }) {
       name,
       email,
       password,
+      timezone: getBrowserTimezone() || undefined,
     }),
   });
 
@@ -60,6 +70,17 @@ export async function loginUser({ email, password }) {
 
 export async function getCurrentUser() {
   const response = await apiRequest("/api/auth/me");
+
+  saveStoredUser(response.user);
+
+  return response.user;
+}
+
+export async function updateTimezone(timezone) {
+  const response = await apiRequest("/api/auth/me", {
+    method: "PATCH",
+    body: JSON.stringify({ timezone }),
+  });
 
   saveStoredUser(response.user);
 

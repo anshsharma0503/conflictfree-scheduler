@@ -27,13 +27,17 @@ ConflictFree is a smart scheduling and resource allocation web application. It h
 - HTTP-only cookies
 - Google OAuth
 - bcrypt password hashing
+- Socket.io
+- BullMQ (pinned `6.7.2`) with ioredis (`5.11.1`) on Redis
+- Google Gemini API (REST via `fetch`, no SDK) for the scheduling assistant
 - Supertest
 - Node test runner
 
 ### Local Development
 
 - Local MongoDB Community Server
-- Docker is deferred
+- Docker only for local Redis (`docker compose up -d redis`, Decision 43). Everything else runs natively.
+- Production Redis: Redis Cloud or Upstash through `REDIS_URL` (`rediss://`), with `maxmemory-policy noeviction`.
 - Backend default port: `5000`
 - Frontend default port: `5173`
 
@@ -41,17 +45,18 @@ ConflictFree is a smart scheduling and resource allocation web application. It h
 
 ### Implemented (2026-11-18 redesign)
 
-- One visual design system ("Instrument", Decision 38): paper/ink palette, green for free or confirmed, orange for conflict, Geist and Geist Mono type, and no colour-only signals.
+- One visual design system ("Instrument", Decision 38): paper/ink palette, green for free or confirmed, orange for conflict, Geist and Geist Mono type (self-hosted, so pages never wait on a third-party font server; Decision 50), and no colour-only signals.
 - The authenticated app uses a sidebar layout with separate pages for Overview, Events, New event, Find a time, and Rooms & equipment (Decision 39). A global status line shows the latest action result.
 - Selecting a slot or suggestion on Find a time opens the composer with the time and any allocated resource filled in.
 - Picking participants turns the composer's action into "Confirm shared meeting". Personal events cannot carry participants (Decision 40).
 - Layouts work down to phone width (390px): the sidebar becomes a top bar, side columns stack, and the week calendar scrolls inside its own box.
 - Interactive elements are real buttons, links, and labelled inputs, with 44px minimum touch targets and visible focus rings.
+- Dashboard pages update live through the Phase L socket client (see Real-Time Requirements).
+- A notification bell in the top bar shows the unread count and the latest notifications (Phase M).
 
 ### Planned
 
 - Dark theme.
-- Live updates on dashboard pages through the Phase L socket client.
 - Opening an event directly from the week calendar.
 
 ## Authentication Requirements
@@ -71,8 +76,11 @@ ConflictFree is a smart scheduling and resource allocation web application. It h
 - Logout clears the auth cookie.
 - Protected backend routes use authentication middleware.
 - Protected frontend routes redirect logged-out users to `/login`.
+- Each account stores its real IANA timezone. Sign-up records the browser's zone (falling back to UTC if invalid). Users can switch to their browser's zone from the sidebar (`PATCH /api/auth/me`, Decision 51).
 
 ### Planned Later
+
+- Choosing any timezone (not only the browser's), and offering the switch at phone width.
 
 - CSRF protection.
 - Rate limiting.
@@ -408,41 +416,49 @@ POST   /api/meetings/:id/cancel
 Required algorithmic components from the proposal:
 
 - Event and resource indexing extensions to the Trie data structure.
-- Socket.io live updates, Gemini scheduling NLP, and BullMQ background workers.
+
+(Socket.io live updates were delivered in Phase L, BullMQ background workers in Phase M, and Gemini scheduling NLP in Phase N.)
 
 
 ## Resource Requirements
 
+### Implemented (Phase H and Phase I)
+
+Users can create, view, edit and deactivate shared rooms and equipment, book them on events and meetings without double-booking, and have a free resource allocated automatically. Details: "Phase H" and "Phase I" under Scheduling Requirements.
+
 ### Planned
 
-Users should be able to:
-
-- Create resources.
-- View available resources.
-- Reserve shared resources.
-- Avoid double-booking resources.
-
-Examples:
-
-- Meeting rooms
-- Equipment
-- Shared spaces
+- Shared spaces as a separate resource type (today: `room` and `equipment`).
 
 ## AI/Natural Language Requirements
 
-### Planned
+### Implemented (Phase N, 2026-11-21)
 
-Use Gemini later to parse scheduling requests such as:
-
-- "Schedule a meeting with Alex tomorrow afternoon for one hour."
-
-The app should extract:
+On Find a time, users can describe a meeting in one sentence, e.g. "Schedule a meeting with Alex tomorrow afternoon for one hour" or "45 min with Priya next Tuesday afternoon, need a room for 4". Google Gemini extracts:
 
 - `title`
-- `participants`
-- `date/time range`
+- `participants` (names or emails as written)
+- date/time range (relative dates are read in the user's timezone)
 - `duration`
-- `constraints`
+- constraints: preferred hours, "not too early", "not too late", room or equipment, number of attendees
+
+Behaviour:
+- The app shows its interpretation first: title, window, length, preferences, room needs, people, and any assumptions it made ("No length given, so using 30 minutes"). Nothing is searched or booked until the user chooses "Search these times" (runs smart suggestions on exactly those values) or "Fill the form only".
+- People are matched to registered ConflictFree accounts on the server. Each one is shown as matched, ambiguous ("Which “Alex”?", the user chooses), or "No account for “Zed”". The requester is never added. Unresolved names are left out of the search.
+- Selecting a resulting time opens the composer with the parsed title and the chosen people, ready to "Confirm shared meeting".
+- Text that isn't a scheduling request, or a time already in the past, gets a clear message instead of a draft.
+- Only the sentence, the current local time and the user's timezone go to Gemini, never other users' data or the user's calendar. The request text is not logged.
+- When Gemini is busy or slow, the app tries a fallback model and one delayed retry, then says so ("busy right now… or fill in the form yourself"). The rest of Find a time keeps working.
+- Each user can make up to 10 assistant requests per minute.
+- Without `GEMINI_API_KEY`, the assistant is hidden and the rest of the app works unchanged.
+
+API: `GET /api/assistant/status`, `POST /api/assistant/parse-request` (details in `ARCHITECTURE.md`). Decisions 47–49.
+
+### Planned
+
+- Natural-language requests from the composer and event editing ("move my 3pm to Friday").
+- Explaining suggestions in plain language.
+- Shared (Redis) rate limiting across API instances (Phase P).
 
 ## Real-Time Requirements
 
@@ -466,17 +482,43 @@ The app should extract:
 - The connection state is visible in the top bar.
 - Verified with Playwright using two browser contexts (two users).
 
-### Planned (Phase M)
+### Implemented (Phase M, 2026-11-21)
 
-- In-app notification pushes (`notification:created`) once BullMQ notifications exist. Email/SMS is out of scope until in-app notifications are correct.
+- `notification:created` `{ notification, unreadCount }` is pushed to the recipient's private room when a notification is stored.
+- `notification:read` `{ notificationIds | all, unreadCount }` is pushed to the user's own room after a mark-read, so other tabs stay in sync.
 
 ## Background Job Requirements
 
+### Implemented (Phase M, 2026-11-21)
+
+Redis + BullMQ power in-app notifications and event reminders (Decisions 43–46).
+
+**Notifications.** A user gets an in-app notification when:
+- they are invited to a shared meeting (`invitation.created`);
+- someone accepts or declines their meeting (organizer only, `invitation.responded`);
+- the organizer moves a meeting, or changes its location or room/equipment, unless they declined it (`meeting.updated`). Edits to the title or description only do not notify;
+- the organizer cancels or deletes a meeting they were invited to (`meeting.cancelled`).
+
+The person who made the change is never notified about their own action.
+
+**Reminders.**
+- Each user chooses how long before an event to be reminded: Off, 5, 10, 15 (default), 30 or 60 minutes, or 1 day.
+- Reminders go to the event's organizer and to participants who accepted. Pending and declined invitees get none.
+- A reminder is sent once per event and start time. Moving the event sends a new one. Cancelled and already-started events get none.
+- Reminders arrive within one sweep interval of being due (default 60s).
+
+**Behaviour and guarantees.**
+- Notifications are stored in MongoDB, newest first, with an unread count, and kept for 90 days.
+- A notification is never duplicated, including when its job is retried.
+- Users can mark one or all as read. They only ever see their own notifications.
+- Without `REDIS_URL` the app runs normally with notifications and reminders off. If Redis goes down, every request still succeeds. The UI shows "paused" while delivery is down. Workers and the reminder schedule recover by themselves when Redis returns, including after Redis lost its data.
+- Known limitation: meeting notifications for actions taken while Redis was unreachable are not sent later. Reminders are unaffected.
+
+API: `GET /api/notifications`, `PATCH /api/notifications/:id/read`, `POST /api/notifications/read-all`, `GET|PATCH /api/notifications/preferences` (details in `ARCHITECTURE.md`).
+
 ### Planned
 
-Use Redis and BullMQ later for:
-
-- Reminder jobs
-- Notification queues
-- Calendar sync jobs
-- Docker may be useful later for Redis.
+- Calendar sync jobs (Phase O, Google Calendar).
+- Transactional outbox, so notifications for actions taken during a Redis outage are sent once Redis returns.
+- A separate worker process (needs the Socket.io Redis adapter/emitter) for horizontal scaling (Phase P).
+- Email delivery of notifications (out of scope until in-app notifications have been in use).

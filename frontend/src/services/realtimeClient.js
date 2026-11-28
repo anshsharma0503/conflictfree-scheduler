@@ -19,6 +19,7 @@ export const REALTIME_EVENTS = Object.freeze([
   "resource:deactivated",
   "resource:booking-changed",
   "notification:created",
+  "notification:read",
 ]);
 
 /**

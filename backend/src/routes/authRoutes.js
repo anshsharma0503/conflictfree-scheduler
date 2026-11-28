@@ -6,6 +6,7 @@ import {
   logout,
   register,
   startGoogleLogin,
+  updateCurrentUser,
 } from "../controllers/authController.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 
@@ -16,6 +17,7 @@ router.post("/login", login);
 router.get("/google", startGoogleLogin);
 router.get("/google/callback", handleGoogleCallback);
 router.get("/me", requireAuth, getCurrentUser);
+router.patch("/me", requireAuth, updateCurrentUser);
 router.post("/logout", logout);
 
 export default router;

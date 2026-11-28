@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "./AuthContext";
 import { useRealtimeUpdates } from "../hooks/useRealtimeUpdates";
 import { DashboardContext } from "./dashboardContext";
@@ -25,6 +25,14 @@ import {
   listInvitations,
   respondToInvitation,
 } from "../services/meetingService";
+import {
+  getNotificationPreferences,
+  listNotifications,
+  markAllNotificationsRead,
+  markNotificationRead,
+  updateNotificationPreferences,
+} from "../services/notificationService";
+import { getAssistantStatus } from "../services/assistantService";
 import {
   formatEventTime,
   normalizeTimezone,
@@ -118,6 +126,8 @@ function upsertById(items, item) {
     : [...items, item];
 }
 
+const MAX_NOTIFICATIONS = 50;
+
 function getEventsStatus(loadedEvents) {
   return loadedEvents.length ? `${loadedEvents.length} event(s) loaded` : "No events yet";
 }
@@ -169,7 +179,30 @@ function DashboardProvider({ children }) {
   // the shown slot results out of date. Results are never silently re-run.
   const [availabilityStale, setAvailabilityStale] = useState(false);
 
+  // In-app notifications (Phase M). Newest first; capped so a long session
+  // does not grow without bound.
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notificationPreferences, setNotificationPreferences] = useState(null);
+  const [notificationError, setNotificationError] = useState("");
+  // Gemini scheduling assistant (Phase N); hidden unless the server has it.
+  const [assistantStatus, setAssistantStatus] = useState({ enabled: false, model: null });
+
   const isEditing = Boolean(editingEventId);
+
+  // When the account's time zone changes (sidebar "Use <zone>"), keep the
+  // composer's zone in step unless the user picked a different one by hand.
+  const previousTimezoneRef = useRef(userTimezone);
+  useEffect(() => {
+    const previous = previousTimezoneRef.current;
+    previousTimezoneRef.current = userTimezone;
+
+    if (previous !== userTimezone) {
+      setFormData((current) =>
+        current.timezone === previous ? { ...current, timezone: userTimezone } : current,
+      );
+    }
+  }, [userTimezone]);
 
   function formatTime(isoDate) {
     return formatEventTime(isoDate, userTimezone);
@@ -201,6 +234,48 @@ function DashboardProvider({ children }) {
       setResources(await listResources());
     } catch {
       // Resources are optional on the dashboard; a failure is non-fatal.
+    }
+  }
+
+  async function loadNotifications() {
+    try {
+      const result = await listNotifications();
+      setNotifications(result.notifications);
+      setUnreadCount(result.unreadCount);
+    } catch {
+      // Notifications are optional on the dashboard; a failure is non-fatal.
+    }
+  }
+
+  function applyPushedNotification({ notification, unreadCount: pushedCount } = {}) {
+    if (!notification?.id) return;
+
+    setNotifications((current) =>
+      [notification, ...current.filter((item) => item.id !== notification.id)].slice(
+        0,
+        MAX_NOTIFICATIONS,
+      ),
+    );
+
+    if (typeof pushedCount === "number") {
+      setUnreadCount(pushedCount);
+    }
+
+    if (notification.type === "event.reminder") {
+      setStatusMessage(`Reminder: ${notification.message}`);
+    }
+  }
+
+  // Another tab (or this one) marked notifications as read.
+  function applyNotificationsRead({ notificationIds = [], all = false, unreadCount: pushedCount } = {}) {
+    setNotifications((current) =>
+      current.map((item) =>
+        all || notificationIds.includes(item.id) ? { ...item, read: true } : item,
+      ),
+    );
+
+    if (typeof pushedCount === "number") {
+      setUnreadCount(pushedCount);
     }
   }
 
@@ -263,11 +338,14 @@ function DashboardProvider({ children }) {
         markAvailabilityStale();
       },
       "resource:booking-changed": markAvailabilityStale,
+      "notification:created": applyPushedNotification,
+      "notification:read": applyNotificationsRead,
     },
     onResync: () => {
       loadEvents();
       loadInvitations();
       loadResources();
+      loadNotifications();
       markAvailabilityStale();
     },
     onSessionExpired: () => {
@@ -311,6 +389,37 @@ function DashboardProvider({ children }) {
       })
       .catch(() => {
         // Invitations are optional on the dashboard; a failure is non-fatal.
+      });
+
+    listNotifications()
+      .then((result) => {
+        if (isActive) {
+          setNotifications(result.notifications);
+          setUnreadCount(result.unreadCount);
+        }
+      })
+      .catch(() => {
+        // Notifications are optional on the dashboard; a failure is non-fatal.
+      });
+
+    getNotificationPreferences()
+      .then((preferences) => {
+        if (isActive && preferences) {
+          setNotificationPreferences(preferences);
+        }
+      })
+      .catch(() => {
+        // Without preferences the reminder setting is simply hidden.
+      });
+
+    getAssistantStatus()
+      .then((status) => {
+        if (isActive && status) {
+          setAssistantStatus(status);
+        }
+      })
+      .catch(() => {
+        // The assistant is optional; without a status it stays hidden.
       });
 
     return () => {
@@ -420,28 +529,28 @@ function DashboardProvider({ children }) {
     }
   }
 
-  function buildPreferences() {
+  function buildPreferences(data = slotSearchData) {
     const preferences = {};
 
     if (
-      slotSearchData.preferredStartHour !== "" &&
-      slotSearchData.preferredStartHour !== null
+      data.preferredStartHour !== "" &&
+      data.preferredStartHour !== null
     ) {
-      preferences.preferredStartHour = Number(slotSearchData.preferredStartHour);
+      preferences.preferredStartHour = Number(data.preferredStartHour);
     }
     if (
-      slotSearchData.preferredEndHour !== "" &&
-      slotSearchData.preferredEndHour !== null
+      data.preferredEndHour !== "" &&
+      data.preferredEndHour !== null
     ) {
-      preferences.preferredEndHour = Number(slotSearchData.preferredEndHour);
+      preferences.preferredEndHour = Number(data.preferredEndHour);
     }
-    if (slotSearchData.avoidEarlyMorning) {
+    if (data.avoidEarlyMorning) {
       preferences.avoidEarlyMorning = true;
     }
-    if (slotSearchData.avoidLateDay) {
+    if (data.avoidLateDay) {
       preferences.avoidLateDay = true;
     }
-    if (slotSearchData.earliestSlotBonus) {
+    if (data.earliestSlotBonus) {
       preferences.earliestSlotBonus = true;
     }
     preferences.timezone = userTimezone;
@@ -449,25 +558,27 @@ function DashboardProvider({ children }) {
     return preferences;
   }
 
-  function collectSearchParticipantEmails() {
-    const emailsFromPicked = pickedParticipants.map((p) => p.email).filter(Boolean);
-    const emailsFromQuery = parseParticipantEmails(
-      participantSearchQuery || slotSearchData.participantEmails,
-    );
+  function collectSearchParticipantEmails(
+    data = slotSearchData,
+    people = pickedParticipants,
+    typedQuery = participantSearchQuery,
+  ) {
+    const emailsFromPicked = people.map((p) => p.email).filter(Boolean);
+    const emailsFromQuery = parseParticipantEmails(typedQuery || data.participantEmails);
 
     return Array.from(new Set([...emailsFromPicked, ...emailsFromQuery]));
   }
 
-  function buildResourceRequest() {
+  function buildResourceRequest(data = slotSearchData) {
     return {
-      resourceId: slotSearchData.resourceId || undefined,
-      attendeeCount: slotSearchData.attendeeCount
-        ? Number(slotSearchData.attendeeCount)
+      resourceId: data.resourceId || undefined,
+      attendeeCount: data.attendeeCount
+        ? Number(data.attendeeCount)
         : undefined,
-      autoAllocateResource: slotSearchData.autoAllocateResource || undefined,
+      autoAllocateResource: data.autoAllocateResource || undefined,
       resourceType:
-        slotSearchData.autoAllocateResource && slotSearchData.resourceType
-          ? slotSearchData.resourceType
+        data.autoAllocateResource && data.resourceType
+          ? data.resourceType
           : undefined,
     };
   }
@@ -510,15 +621,21 @@ function DashboardProvider({ children }) {
     }
   }
 
-  async function handleFindSuggestions(event) {
+  // `overrides` lets the assistant search with values it just filled in,
+  // before React has re-rendered with the new state.
+  async function handleFindSuggestions(event, overrides = {}) {
     if (event?.preventDefault) {
       event.preventDefault();
     }
 
+    const data = overrides.searchData || slotSearchData;
+    const people = overrides.participants || pickedParticipants;
+    const typedQuery = overrides.participants ? "" : participantSearchQuery;
+
     setSlotSearchError("");
     setSuggestionError("");
 
-    if (slotSearchData.autoAllocateResource && slotSearchData.resourceId) {
+    if (data.autoAllocateResource && data.resourceId) {
       setSuggestionError(
         "Cannot specify both a manual resource and automatic resource allocation",
       );
@@ -529,22 +646,15 @@ function DashboardProvider({ children }) {
 
     try {
       const result = await findSmartSuggestions({
-        windowStart: toIsoDate(slotSearchData.windowStart, userTimezone),
-        windowEnd: toIsoDate(slotSearchData.windowEnd, userTimezone),
-        durationMinutes: Number(slotSearchData.durationMinutes),
-        slotStepMinutes: slotSearchData.slotStepMinutes
-          ? Number(slotSearchData.slotStepMinutes)
-          : 30,
-        preferences: buildPreferences(),
-        minimumScore:
-          slotSearchData.minimumScore !== ""
-            ? Number(slotSearchData.minimumScore)
-            : 0,
-        maxSuggestions: slotSearchData.maxSuggestions
-          ? Number(slotSearchData.maxSuggestions)
-          : 3,
-        participantEmails: collectSearchParticipantEmails(),
-        ...buildResourceRequest(),
+        windowStart: toIsoDate(data.windowStart, userTimezone),
+        windowEnd: toIsoDate(data.windowEnd, userTimezone),
+        durationMinutes: Number(data.durationMinutes),
+        slotStepMinutes: data.slotStepMinutes ? Number(data.slotStepMinutes) : 30,
+        preferences: buildPreferences(data),
+        minimumScore: data.minimumScore !== "" ? Number(data.minimumScore) : 0,
+        maxSuggestions: data.maxSuggestions ? Number(data.maxSuggestions) : 3,
+        participantEmails: collectSearchParticipantEmails(data, people, typedQuery),
+        ...buildResourceRequest(data),
       });
 
       setSmartSuggestions(result.suggestions || []);
@@ -796,6 +906,91 @@ function DashboardProvider({ children }) {
     }
   }
 
+  /**
+   * Fills Find a time (and the composer's title) from a draft parsed by the
+   * scheduling assistant. With `search: true` it also runs smart
+   * suggestions on exactly those values.
+   */
+  function handleApplyAssistantRequest(draft, participants = [], { search = false } = {}) {
+    const searchData = {
+      ...slotSearchData,
+      windowStart: toDateTimeLocalValue(draft.windowStart, userTimezone),
+      windowEnd: toDateTimeLocalValue(draft.windowEnd, userTimezone),
+      durationMinutes: draft.durationMinutes,
+      preferredStartHour: draft.preferences?.preferredStartHour ?? "",
+      preferredEndHour: draft.preferences?.preferredEndHour ?? "",
+      avoidEarlyMorning: Boolean(draft.preferences?.avoidEarlyMorning),
+      avoidLateDay: Boolean(draft.preferences?.avoidLateDay),
+      autoAllocateResource: Boolean(draft.resource?.type),
+      resourceType: draft.resource?.type || "",
+      resourceId: draft.resource?.type ? "" : slotSearchData.resourceId,
+      attendeeCount: draft.resource?.attendeeCount
+        ? String(draft.resource.attendeeCount)
+        : slotSearchData.attendeeCount,
+    };
+
+    setSlotSearchData(searchData);
+    setPickedParticipants(participants);
+    setParticipantSearchQuery("");
+    setFormData((prev) => ({ ...prev, title: draft.title }));
+    setStatusMessage(`Filled in “${draft.title}” from your description`);
+
+    if (search) {
+      return handleFindSuggestions(undefined, { searchData, participants });
+    }
+
+    return undefined;
+  }
+
+  async function handleMarkNotificationRead(notificationId) {
+    const target = notifications.find((item) => item.id === notificationId);
+
+    if (!target || target.read) {
+      return;
+    }
+
+    // Optimistic: the item looks read at once; the server count follows.
+    setNotifications((current) =>
+      current.map((item) => (item.id === notificationId ? { ...item, read: true } : item)),
+    );
+    setUnreadCount((count) => Math.max(0, count - 1));
+
+    try {
+      const result = await markNotificationRead(notificationId);
+      setUnreadCount(result.unreadCount);
+      setNotificationError("");
+    } catch (err) {
+      setNotificationError(err.message);
+      loadNotifications();
+    }
+  }
+
+  async function handleMarkAllNotificationsRead() {
+    setNotifications((current) => current.map((item) => ({ ...item, read: true })));
+    setUnreadCount(0);
+
+    try {
+      const result = await markAllNotificationsRead();
+      setUnreadCount(result.unreadCount);
+      setNotificationError("");
+    } catch (err) {
+      setNotificationError(err.message);
+      loadNotifications();
+    }
+  }
+
+  async function handleUpdateReminderPreference(minutes) {
+    try {
+      const preferences = await updateNotificationPreferences({
+        reminderMinutesBefore: Number(minutes),
+      });
+      setNotificationPreferences(preferences);
+      setNotificationError("");
+    } catch (err) {
+      setNotificationError(err.message);
+    }
+  }
+
   function handleRefreshAvailability() {
     if (hasSearchedSlots) {
       handleFindSlots();
@@ -871,6 +1066,17 @@ function DashboardProvider({ children }) {
     invitationMessage,
     invitationError,
     handleRespondInvitation,
+
+    assistantStatus,
+    handleApplyAssistantRequest,
+
+    notifications,
+    unreadCount,
+    notificationPreferences,
+    notificationError,
+    handleMarkNotificationRead,
+    handleMarkAllNotificationsRead,
+    handleUpdateReminderPreference,
   };
 
   return <DashboardContext.Provider value={value}>{children}</DashboardContext.Provider>;

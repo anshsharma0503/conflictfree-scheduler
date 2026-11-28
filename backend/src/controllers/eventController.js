@@ -293,6 +293,7 @@ export async function updateEvent(req, res) {
       previousResourceId: event.resource ? event.resource.toString() : null,
       previousStartAt: event.startAt,
       previousEndAt: event.endAt,
+      previousLocation: event.location || "",
     };
 
     const hasNewResourceId =

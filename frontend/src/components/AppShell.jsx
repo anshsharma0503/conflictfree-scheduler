@@ -1,6 +1,9 @@
+import { useState } from "react";
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
+import { getBrowserTimezone, updateTimezone } from "../services/authService";
 import BrandMark from "./BrandMark";
 import Icon from "./Icon";
+import NotificationBell from "./NotificationBell";
 import { useAuth } from "../context/AuthContext";
 import { useDashboard } from "../hooks/useDashboard";
 
@@ -33,7 +36,26 @@ const REALTIME_LABELS = {
 
 function AppShell() {
   const navigate = useNavigate();
-  const { logoutUser } = useAuth();
+  const { logoutUser, setAuthUser } = useAuth();
+  const [browserTimezone] = useState(() => getBrowserTimezone());
+  const [isSavingTimezone, setIsSavingTimezone] = useState(false);
+  const [timezoneError, setTimezoneError] = useState("");
+
+  // Accounts created before timezones were recorded (and Google sign-ins)
+  // are UTC; one click aligns the account with this browser (Decision 51).
+  async function handleUseBrowserTimezone() {
+    setIsSavingTimezone(true);
+    setTimezoneError("");
+
+    try {
+      const updatedUser = await updateTimezone(browserTimezone);
+      setAuthUser?.(updatedUser);
+    } catch (error) {
+      setTimezoneError(error.message);
+    } finally {
+      setIsSavingTimezone(false);
+    }
+  }
   const {
     user,
     userTimezone,
@@ -82,6 +104,21 @@ function AppShell() {
             <span className="dot dot-free" aria-hidden="true" />
             {userTimezone}
           </span>
+          {browserTimezone && browserTimezone !== userTimezone ? (
+            <button
+              className="btn btn-ghost btn-sm timezone-switch"
+              type="button"
+              onClick={handleUseBrowserTimezone}
+              disabled={isSavingTimezone}
+            >
+              Use {browserTimezone}
+            </button>
+          ) : null}
+          {timezoneError ? (
+            <span className="field-hint" role="alert">
+              {timezoneError}
+            </span>
+          ) : null}
         </div>
 
         <div className="sidebar-user">
@@ -120,6 +157,7 @@ function AppShell() {
             <span className="live-dot" aria-hidden="true" />
             {REALTIME_LABELS[realtimeStatus] || "Offline"}
           </span>
+          <NotificationBell />
           <Link className="btn btn-primary" to="/dashboard/events/new" onClick={handleNewEvent}>
             <Icon name="plus" size={16} strokeWidth={2} />
             New event

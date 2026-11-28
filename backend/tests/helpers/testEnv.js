@@ -47,4 +47,19 @@ if (testUri) {
   process.env.MONGODB_URI = testUri;
 }
 
+// Redis for the queue tests. Their keys always live under the "cftest"
+// prefix, and the tests only ever obliterate queues under that prefix, so
+// development jobs in the same Redis are never touched.
+process.env.REDIS_URL =
+  process.env.REDIS_URL_TEST ||
+  loaded.REDIS_URL_TEST ||
+  process.env.REDIS_URL ||
+  loaded.REDIS_URL ||
+  "redis://127.0.0.1:6379";
+process.env.BULLMQ_PREFIX = "cftest";
+
+// Automated tests never call the real (paid) Gemini API. Assistant tests
+// inject a fake client; `npm run assistant:smoke` exercises the real one.
+process.env.GEMINI_API_KEY = "";
+
 process.env.NODE_ENV = "test";

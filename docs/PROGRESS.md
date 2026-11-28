@@ -363,6 +363,83 @@ Audit items that depended on the frontend restructure:
   - The trie test now confirms a shared meeting, because the picked participant carries over to the composer.
 - Gate: frontend 70/70, lint clean apart from the existing `AuthContext.jsx` fast-refresh rule, `vite build` passes, E2E 13/13. Pages were also checked in screenshots at 1440px and 390px.
 
+### Phase M: Redis + BullMQ In-App Notifications and Reminders (complete, 2026-11-21)
+
+Infrastructure:
+- `docker-compose.yml` (repository root): `redis:7.4-alpine` as `conflictfree-redis`, bound to `127.0.0.1:6379`, `noeviction`, AOF, healthcheck. Verified `healthy`, with `maxmemory-policy` = `noeviction` (Decision 43).
+- Docker Desktop 29.9.3 on this machine. Start Redis with `docker compose up -d redis`.
+- Dependencies pinned: `bullmq@6.7.2` (released 2026-11-07) and `ioredis@5.11.1`. BullMQ 6 makes ioredis an optional peer, so it is installed explicitly.
+- `backend/.env` now has `REDIS_URL=redis://127.0.0.1:6379`. `.env.example` documents the Redis Cloud / Upstash `rediss://` formats, `BULLMQ_PREFIX`, `REMINDER_SWEEP_INTERVAL_MS` and `REDIS_URL_TEST`.
+
+Backend:
+- `config/redis.js`: env parsing and validation, producer (fail-fast) and worker (`maxRetriesPerRequest: null`) connections.
+- `models/Notification.js`: per-user unique `dedupeKey`, 90-day TTL. `User.reminderMinutesBefore` (default 15). Event index `{ startAt: 1, status: 1 }`.
+- `services/notifications/notificationRules.js` (pure rules) and `notificationService.js` (idempotent upsert, list, mark read, push).
+- `queues/processors.js`: notification job processor and `runReminderSweep`.
+- `queues/queueService.js`: two queues, two workers, the `reminder-sweep` job scheduler, the scheduler watchdog, `enqueueNotification` (never throws), graceful stop.
+- `services/schedulingEvents.js` queues jobs for meeting confirmation, RSVP, attendee-relevant meeting edits (time, location, resource), cancellation and deletion of shared meetings. Jobs carry ids only.
+- `/api/notifications` routes (list, read, read-all, preferences). `server.js` starts and stops the queues.
+- Bugs found and fixed while testing:
+  - Mongoose timestamps conflicted with `$setOnInsert` in the idempotent bulk upsert (`timestamps: false` on the operation).
+  - A `createdAt` page cursor would skip notifications created in the same sweep; the cursor is now the notification id (Decision 46).
+  - BullMQ keeps an add pending while Redis is down, so adds would pile up in memory during an outage. Enqueue now skips immediately when the producer is not connected, with a 3s cap.
+  - Shutdown could hang on dead Redis connections; each close now has a timeout.
+  - The reminder scheduler disappeared if Redis lost its data while the API ran. Found by E2E, because Playwright resets Redis after the backend has started. A watchdog now restores it (Decision 45).
+
+Verification:
+- Backend tests: 45 new tests across 6 files (see `ARCHITECTURE.md` → Backend Testing). `queue.integration.test.js` runs against the real Docker Redis.
+- Manual API check against a running server (scratch database and BullMQ prefix, both removed afterwards): two registered users; confirm → the invitee had `invitation.created`; accept → the organizer had `invitation.responded`; both received `event.reminder` for the meeting 10 minutes out, and the invitee only after accepting; read-all → `unreadCount` 0; preference → 60; `deliveryStatus` `ready`.
+- Manual outage check: `docker stop conflictfree-redis` while the API ran → `POST /api/meetings/confirm` still returned 201 in 0.03s, with `deliveryStatus` `degraded` and one `notification_enqueue_skipped` log. `docker start` → the connections were restored automatically, `deliveryStatus` was `ready` again, and the next confirmation produced its notification.
+- Frontend: `NotificationBell` in the top bar, provider state and handlers, `notificationService.js`, `relativeTime.js`. 15 new tests.
+- E2E: `notifications.spec.js` (2 tests) against real Redis on the `cfe2e` prefix. The full suite passed 16/16, and the two new tests passed 6/6 more times with `--repeat-each=3`.
+
+### Phase M gate re-run on MongoDB Atlas (2026-11-21)
+
+- `MONGODB_URI` now points to MongoDB Atlas, with the network access list open to all IPs. Backend 387/387 against Atlas, frontend 105/105, E2E 16/16 (E2E still uses the local `rs0` by default).
+- One later run had 46 failures, all Atlas connection errors (`secureConnect timed out`, `SystemOverloadedError`, server selection timeouts) and no assertion failures. The next run passed fully. Atlas M0 clusters are throttled and the network was degraded at the time; this was not a code issue.
+
+### Phase N: Gemini Natural-Language Scheduling Assistant (complete, 2026-11-21)
+
+Model selection (measured with the project key, Decision 48):
+- `gemini-3.8-flash` returned 503 "high demand". `gemini-2.5-flash` returned 404 (retired). `gemini-3.5-flash` was correct but took 54–63s.
+- `gemini-3.5-flash-lite` with minimal thinking: correct in 1.1–2.7s (primary). `gemini-3.1-flash-lite`: correct in about 2.1s (fallback).
+
+Backend:
+- `config/gemini.js`, `services/assistant/*` (REST client, prompt and schema, parser and validation, resolver, rate limiter), `/api/assistant/status` and `/api/assistant/parse-request`, `npm run assistant:smoke`.
+- People are resolved through the existing participant Trie. Gemini never receives user data (Decision 47).
+
+Frontend:
+- `RequestAssistant.jsx` ("Describe it") on Find a time, `assistantService.js`, `handleApplyAssistantRequest` in the provider. The search builders now take explicit data, so "Search these times" uses the freshly parsed values.
+
+Bugs found and fixed in this phase:
+- **Gemini demand spikes:** an E2E run saw both models "busy". The client now waits 1.5s and makes one more pass, but never after a timeout. The E2E test retries the way a user would (Decision 48).
+- **Render-blocking Google Fonts (pre-existing):** a hung `fonts.googleapis.com` request stalled page loads (three E2E timeouts; real users would have seen the same). Geist and Geist Mono are now self-hosted with `@fontsource-variable/*` 5.3.0. E2E time went from 2.6 to 1.0 min (Decision 50).
+- **Every account was UTC (pre-existing):** registration never stored a timezone and it couldn't be changed, so "afternoon", reminders and the calendar used UTC. Sign-up now sends the browser's zone, there is a new `PATCH /api/auth/me`, and the sidebar offers "Use <browser zone>" (Decision 51).
+- **Phase M lint error:** `e2e/globalSetup.js` re-threw without `cause`.
+- **Assistant E2E timeout:** the test needed more than Playwright's default 30s for a real model call.
+- **Quota spent on invalid text:** text is now validated before the rate limiter counts the request.
+
+Verification:
+- Live smoke against the real Gemini API (`npm run assistant:smoke`, Asia/Kolkata, Saturday 21 Nov). Every relative date resolved correctly: "tomorrow afternoon" → Sun 22 12:00–17:00; "next week" → Mon 23 09:00 – Fri 27 18:00; "Friday at 3pm" → 27 Nov 15:00–16:30 for 90 min, with a room for 6. The prompt-injection sentence and an off-topic question were both refused (422).
+- Manual API check against a running server (scratch local database, removed afterwards): status `enabled` with `gemini-3.5-flash-lite`; "45 min roadmap review with Priya and Bob next Tuesday afternoon, need a room for 3" → Priya matched to her real account, Bob `not_found`, a room for 3, window Tue 24 12:00–17:00, in 1.76s; empty text → 400; no session → 401. The request text did not appear in the server log.
+- Automated tests: 35 new backend tests across 4 files, and 11 new frontend tests across 2 files. E2E `assistant.spec.js` makes a real Gemini call.
+
+### Developer tooling: one-command setup and start (2026-11-21)
+
+- `setup.cmd` / `setup.ps1` (project root): checks prerequisites (Node 22+, npm, Docker), creates `backend/.env` from the example without overwriting values (it replaces only a placeholder or empty `JWT_SECRET` with 48 random bytes), installs dependencies, starts Docker Desktop and Redis and waits for health, starts and initialises local MongoDB when the URI is local, and runs the service check. Switches: `-WithE2E`, `-SkipInstall`, `-NoDocker`.
+- `start.cmd` / `start.ps1`: checks ports, starts Docker/Redis (skipped for a managed `REDIS_URL`), starts local MongoDB if needed, runs the service check, starts backend and frontend in one window, waits for both to answer, and opens the browser. Ctrl+C, or either server exiting, stops both process trees. Switches: `-SeparateWindows`, `-NoBrowser`, `-StopRedisOnExit`, `-Down`.
+- `scripts/dev-common.ps1`: shared helpers. Windows PowerShell 5.1 compatible and ASCII-only.
+- `backend/scripts/checkServices.js` (`npm run check:services [-- --gemini]`): MongoDB (replica set required), Redis (`noeviction`), and the Gemini key. It prints hosts without credentials and exits 1 only when MongoDB is unusable.
+- Verified on this machine:
+  - `setup.cmd` completed (exit 0).
+  - `start.ps1` brought up Redis, Atlas, backend `:5000` (`/api/health` 200), frontend `:5173` (200) and the Vite `/api` proxy (200).
+  - Stopping the backend's process tree made the script stop the frontend, free both ports and leave Redis running.
+  - `start.ps1 -Down` stopped Redis.
+- Bugs caught while testing the scripts:
+  - The service-check output was swallowed into the function's return value, so a failing check would have counted as success. Fixed with `Out-Host`, and verified to return `True`/`False` correctly.
+  - Exit codes were not reported after a server stopped. Fixed by reading the process handle.
+- Behaviour note: when only the backend's `node` process crashes, nodemon keeps running ("waiting for file changes"), so `start.ps1` keeps the frontend up as well. This is intended in development.
+
 ---
 
 ## Current Status
@@ -381,31 +458,38 @@ Audit items that depended on the frontend restructure:
 - Scheduling Phase J (Shared Meeting Confirmation and Invitations) is complete end-to-end.
 - Scheduling Phase K (MongoDB Replica Set and True Atomic Participant/Resource Booking) is complete end-to-end.
 - Unified Timezone Consistency Architecture is complete end-to-end with full automated test coverage.
-- Test results (2026-11-18, this machine):
-  - Backend: 342/342 passing across 36 test files (`npm test`, `rs0` replica set, `conflictfree_test` database).
-  - Frontend: 90/90 passing across 14 test files. Lint is clean except the existing `AuthContext.jsx` fast-refresh rule. `vite build` passes.
-  - E2E: 14/14 passing (13 foundation + 1 two-user real-time), on isolated ports and the `conflictfree_e2e` database.
 - Frontend redesign and dashboard split is complete (Decisions 38–40).
 - Phase L (Socket.io real-time updates) is complete end-to-end (Decisions 36, 37, 41, 42).
+- Phase M (Redis + BullMQ in-app notifications and reminders) is complete end-to-end (Decisions 43–46).
+- Phase N (Gemini natural-language scheduling assistant) is complete end-to-end (Decisions 47–49). The fixes that came with it are in Decisions 50–51.
+- Test results (2026-11-21, this machine):
+  - Backend: 426/426 passing across 46 test files, against MongoDB Atlas, with Docker Redis.
+  - Frontend: 116/116 passing across 18 test files. `vite build` passes. Lint has one remaining error: the existing `AuthContext.jsx` fast-refresh rule, a dev-only hot-reload hint. Fixing it means moving `useAuth` and every import and test mock of it.
+  - E2E: 17/17 passing (13 foundation + 1 real-time + 2 notifications + 1 assistant with a real Gemini call), on the local `rs0` + Docker Redis.
 
 ---
 
 ## Next Feature
 
 Planned next steps:
-1. Phase M: Redis + BullMQ in-app notifications and reminders. Needs a Redis decision: Memurai, WSL Redis, or managed.
-2. Phase N: Gemini natural-language parsing. Needs `GEMINI_API_KEY`.
-3. Phase O: Google Calendar connection. Needs Google Cloud OAuth changes.
-4. Phase P: benchmarks, hardening, and deployment docs.
+1. Phase O: Google Calendar connection. Needs Google Cloud OAuth changes (calendar scope, consent screen). Calendar sync can run as a BullMQ job.
+2. Phase P: benchmarks, hardening, and deployment docs. This includes:
+   - choosing between Redis Cloud and Upstash (measure idle BullMQ command usage);
+   - CSRF protection and general plus Redis-backed rate limiting;
+   - a separate worker process with the Socket.io Redis adapter, if needed;
+   - making `getGoogleLoginUrl()` (hard-coded `http://localhost:5000`) configurable;
+   - production `NODE_ENV`/cookie settings per environment.
 
 ---
 
 ## Deferred
 
-- Docker.
-- Redis.
-- BullMQ.
-- Gemini integration.
+- Docker for anything other than local Redis.
+- Transactional outbox for notifications created during a Redis outage.
+- Separate BullMQ worker process (Socket.io Redis adapter/emitter).
+- Email notifications.
+- Natural-language editing of existing events ("move my 3pm to Friday").
+- Picking any timezone, and the timezone switch at phone width.
 - Google Calendar sync.
 - Production deployment.
 - CSRF protection.

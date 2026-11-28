@@ -22,7 +22,7 @@ ConflictFree is a smart scheduling and resource allocation application. It will 
 - Never claim code works until it has been run successfully.
 - Do not begin a new feature until the current feature completion gate passes.
 - Use local MongoDB Community Server for development.
-- Docker is deferred for now.
+- Docker is used only to run Redis locally (`docker compose up -d redis`, Decision 43). Everything else runs natively; production Redis is Redis Cloud or Upstash.
 
 ## Documentation Rules
 

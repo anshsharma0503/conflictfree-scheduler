@@ -17,6 +17,7 @@ import {
   createGoogleOAuthUrl,
   getGoogleAuthProfileFromCode,
 } from "../services/googleOAuthService.js";
+import { isValidTimezone } from "../services/timezoneService.js";
 import { signAuthToken } from "../services/tokenService.js";
 
 const DEFAULT_FRONTEND_URL = "http://localhost:5173";
@@ -125,6 +126,34 @@ export async function register(req, res) {
       message: error.message,
     });
   }
+}
+
+/**
+ * PATCH /api/auth/me — currently only the timezone can be changed. It
+ * drives how every time in the app is read and shown: reminders, the week
+ * calendar, slot preferences and the assistant's "tomorrow afternoon".
+ */
+export async function updateCurrentUser(req, res) {
+  const timezone = typeof req.body?.timezone === "string" ? req.body.timezone.trim() : "";
+
+  if (!isValidTimezone(timezone)) {
+    return res.status(400).json({
+      success: false,
+      message: "timezone must be a valid IANA time zone, e.g. Asia/Kolkata",
+    });
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user.id,
+    { $set: { timezone } },
+    { returnDocument: "after", runValidators: true },
+  );
+
+  if (!user) {
+    return res.status(404).json({ success: false, message: "User not found" });
+  }
+
+  return res.status(200).json({ success: true, user: serializeUser(user) });
 }
 
 export async function login(req, res) {

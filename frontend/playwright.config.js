@@ -3,7 +3,10 @@ import {
   E2E_API_PORT,
   E2E_API_URL,
   E2E_BASE_URL,
+  E2E_BULLMQ_PREFIX,
   E2E_MONGODB_URI,
+  E2E_REDIS_URL,
+  E2E_REMINDER_SWEEP_INTERVAL_MS,
   E2E_WEB_PORT,
 } from "./e2e/e2eEnv.js";
 
@@ -40,6 +43,9 @@ export default defineConfig({
         PORT: String(E2E_API_PORT),
         MONGODB_URI: E2E_MONGODB_URI,
         FRONTEND_URL: E2E_BASE_URL,
+        REDIS_URL: E2E_REDIS_URL,
+        BULLMQ_PREFIX: E2E_BULLMQ_PREFIX,
+        REMINDER_SWEEP_INTERVAL_MS: E2E_REMINDER_SWEEP_INTERVAL_MS,
       },
     },
     {

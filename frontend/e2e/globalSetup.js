@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { E2E_MONGODB_URI } from "./e2eEnv.js";
+import { E2E_BULLMQ_PREFIX, E2E_MONGODB_URI, E2E_REDIS_URL } from "./e2eEnv.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // Reuse the backend's MongoDB driver instead of adding a frontend dependency.
@@ -36,5 +36,39 @@ export default async function globalSetup() {
     }
   } finally {
     await client.close();
+  }
+
+  await resetE2eQueues();
+}
+
+/**
+ * Removes every BullMQ key under the E2E prefix, so no job or reminder
+ * schedule from an earlier run leaks into this one. Only keys matching
+ * "<prefix>:*" are deleted, and the prefix must end in "e2e".
+ */
+async function resetE2eQueues() {
+  if (!E2E_BULLMQ_PREFIX.endsWith("e2e")) {
+    throw new Error(`Refusing to reset non-E2E BullMQ prefix "${E2E_BULLMQ_PREFIX}"`);
+  }
+
+  const IORedis = requireFromBackend("ioredis");
+  const redis = new IORedis(E2E_REDIS_URL, { maxRetriesPerRequest: 1, connectTimeout: 5000 });
+
+  try {
+    let cursor = "0";
+    do {
+      const [next, keys] = await redis.scan(cursor, "MATCH", `${E2E_BULLMQ_PREFIX}:*`, "COUNT", 500);
+      cursor = next;
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } while (cursor !== "0");
+  } catch (error) {
+    throw new Error(
+      `E2E needs Redis at ${E2E_REDIS_URL} (run "docker compose up -d redis"): ${error.message}`,
+      { cause: error },
+    );
+  } finally {
+    redis.disconnect();
   }
 }
